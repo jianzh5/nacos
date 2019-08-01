@@ -45,6 +45,7 @@ import java.io.UnsupportedEncodingException;
 import java.net.HttpURLConnection;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
@@ -123,7 +124,7 @@ public class RaftCore {
 
         long start = System.currentTimeMillis();
 
-        datums = raftStore.loadDatums(notifier);
+        raftStore.loadDatums(notifier, datums);
 
         setTerm(NumberUtils.toLong(raftStore.loadMeta().getProperty("term"), 0L));
 
@@ -213,7 +214,7 @@ public class RaftCore {
 
             if (!latch.await(UtilsAndCommons.RAFT_PUBLISH_TIMEOUT, TimeUnit.MILLISECONDS)) {
                 // only majority servers return success can we consider this update success
-                Loggers.RAFT.info("data publish failed, caused failed to notify majority, key={}", key);
+                Loggers.RAFT.error("data publish failed, caused failed to notify majority, key={}", key);
                 throw new IllegalStateException("data publish failed, caused failed to notify majority, key=" + key);
             }
 
@@ -243,7 +244,7 @@ public class RaftCore {
             json.put("datum", datum);
             json.put("source", peers.local());
 
-            onDelete(datum, peers.local());
+            onDelete(datum.key, peers.local());
 
             for (final String server : peers.allServersWithoutMySelf()) {
                 String url = buildURL(server, API_ON_DEL);
@@ -317,7 +318,7 @@ public class RaftCore {
         Loggers.RAFT.info("data added/updated, key={}, term={}", datum.key, local.term);
     }
 
-    public void onDelete(Datum datum, RaftPeer source) throws Exception {
+    public void onDelete(String datumKey, RaftPeer source) throws Exception {
 
         RaftPeer local = peers.local();
 
@@ -337,7 +338,7 @@ public class RaftCore {
         local.resetLeaderDue();
 
         // do apply
-        String key = datum.key;
+        String key = datumKey;
         deleteDatum(key);
 
         if (KeyBuilder.matchServiceMetaKey(key)) {
@@ -353,7 +354,7 @@ public class RaftCore {
             raftStore.updateTerm(local.term.get());
         }
 
-        Loggers.RAFT.info("data removed, key={}, term={}", datum.key, local.term);
+        Loggers.RAFT.info("data removed, key={}, term={}", datumKey, local.term);
 
     }
 
@@ -396,7 +397,7 @@ public class RaftCore {
             local.voteFor = local.ip;
             local.state = RaftPeer.State.CANDIDATE;
 
-            Map<String, String> params = new HashMap<String, String>(1);
+            Map<String, String> params = new HashMap<>(1);
             params.put("vote", JSON.toJSONString(local));
             for (final String server : peers.allServersWithoutMySelf()) {
                 final String url = buildURL(server, API_VOTE);
@@ -525,11 +526,11 @@ public class RaftCore {
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             GZIPOutputStream gzip = new GZIPOutputStream(out);
-            gzip.write(content.getBytes("UTF-8"));
+            gzip.write(content.getBytes(StandardCharsets.UTF_8));
             gzip.close();
 
             byte[] compressedBytes = out.toByteArray();
-            String compressedContent = new String(compressedBytes, "UTF-8");
+            String compressedContent = new String(compressedBytes, StandardCharsets.UTF_8);
             Loggers.RAFT.info("raw beat data size: {}, size of compressed data: {}",
                 content.length(), compressedContent.length());
 
@@ -604,14 +605,14 @@ public class RaftCore {
 
         peers.makeLeader(remote);
 
-        Map<String, Integer> receivedKeysMap = new HashMap<String, Integer>(datums.size());
+        Map<String, Integer> receivedKeysMap = new HashMap<>(datums.size());
 
         for (Map.Entry<String, Datum> entry : datums.entrySet()) {
             receivedKeysMap.put(entry.getKey(), 0);
         }
 
         // now check datums
-        List<String> batch = new ArrayList<String>();
+        List<String> batch = new ArrayList<>();
         if (!switchDomain.isSendBeatOnly()) {
             int processedCount = 0;
             Loggers.RAFT.info("[RAFT] received beat with {} keys, RaftCore.datums' size is {}, remote server: {}, term: {}, local term: {}",
@@ -667,41 +668,49 @@ public class RaftCore {
                                 return 1;
                             }
 
-                            List<Datum> datumList = JSON.parseObject(response.getResponseBody(), new TypeReference<List<Datum>>() {
+                            List<JSONObject> datumList = JSON.parseObject(response.getResponseBody(), new TypeReference<List<JSONObject>>() {
                             });
 
-                            for (Datum datum : datumList) {
+                            for (JSONObject datumJson : datumList) {
                                 OPERATE_LOCK.lock();
+                                Datum newDatum = null;
                                 try {
 
-                                    Datum oldDatum = getDatum(datum.key);
+                                    Datum oldDatum = getDatum(datumJson.getString("key"));
 
-                                    if (oldDatum != null && datum.timestamp.get() <= oldDatum.timestamp.get()) {
+                                    if (oldDatum != null && datumJson.getLongValue("timestamp") <= oldDatum.timestamp.get()) {
                                         Loggers.RAFT.info("[NACOS-RAFT] timestamp is smaller than that of mine, key: {}, remote: {}, local: {}",
-                                            datum.key, datum.timestamp, oldDatum.timestamp);
+                                            datumJson.getString("key"), datumJson.getLongValue("timestamp"), oldDatum.timestamp);
                                         continue;
                                     }
 
-                                    raftStore.write(datum);
-
-                                    if (KeyBuilder.matchServiceMetaKey(datum.key)) {
+                                    if (KeyBuilder.matchServiceMetaKey(datumJson.getString("key"))) {
                                         Datum<Service> serviceDatum = new Datum<>();
-                                        serviceDatum.key = datum.key;
-                                        serviceDatum.timestamp.set(datum.timestamp.get());
-                                        serviceDatum.value = JSON.parseObject(JSON.toJSONString(datum.value), Service.class);
-                                        datum = serviceDatum;
+                                        serviceDatum.key = datumJson.getString("key");
+                                        serviceDatum.timestamp.set(datumJson.getLongValue("timestamp"));
+                                        serviceDatum.value =
+                                            JSON.parseObject(JSON.toJSONString(datumJson.getJSONObject("value")), Service.class);
+                                        newDatum = serviceDatum;
                                     }
 
-                                    if (KeyBuilder.matchInstanceListKey(datum.key)) {
+                                    if (KeyBuilder.matchInstanceListKey(datumJson.getString("key"))) {
                                         Datum<Instances> instancesDatum = new Datum<>();
-                                        instancesDatum.key = datum.key;
-                                        instancesDatum.timestamp.set(datum.timestamp.get());
-                                        instancesDatum.value = JSON.parseObject(JSON.toJSONString(datum.value), Instances.class);
-                                        datum = instancesDatum;
+                                        instancesDatum.key = datumJson.getString("key");
+                                        instancesDatum.timestamp.set(datumJson.getLongValue("timestamp"));
+                                        instancesDatum.value =
+                                            JSON.parseObject(JSON.toJSONString(datumJson.getJSONObject("value")), Instances.class);
+                                        newDatum = instancesDatum;
                                     }
 
-                                    datums.put(datum.key, datum);
-                                    notifier.addTask(datum.key, ApplyAction.CHANGE);
+                                    if (newDatum == null || newDatum.value == null) {
+                                        Loggers.RAFT.error("receive null datum: {}", datumJson);
+                                        continue;
+                                    }
+
+                                    raftStore.write(newDatum);
+
+                                    datums.put(newDatum.key, newDatum);
+                                    notifier.addTask(newDatum.key, ApplyAction.CHANGE);
 
                                     local.resetLeaderDue();
 
@@ -715,10 +724,10 @@ public class RaftCore {
                                     raftStore.updateTerm(local.term.get());
 
                                     Loggers.RAFT.info("data updated, key: {}, timestamp: {}, from {}, local term: {}",
-                                        datum.key, datum.timestamp, JSON.toJSONString(remote), local.term);
+                                        newDatum.key, newDatum.timestamp, JSON.toJSONString(remote), local.term);
 
                                 } catch (Throwable e) {
-                                    Loggers.RAFT.error("[RAFT-BEAT] failed to sync datum from leader, key: {} {}", datum.key, e);
+                                    Loggers.RAFT.error("[RAFT-BEAT] failed to sync datum from leader, datum: {}", newDatum, e);
                                 } finally {
                                     OPERATE_LOCK.unlock();
                                 }
@@ -736,7 +745,7 @@ public class RaftCore {
 
             }
 
-            List<String> deadKeys = new ArrayList<String>();
+            List<String> deadKeys = new ArrayList<>();
             for (Map.Entry<String, Integer> entry : receivedKeysMap.entrySet()) {
                 if (entry.getValue() == 0) {
                     deadKeys.add(entry.getKey());
@@ -801,6 +810,10 @@ public class RaftCore {
         }
     }
 
+    public void unlistenAll(String key) {
+        listeners.remove(key);
+    }
+
     public void setTerm(long term) {
         peers.setTerm(term);
     }
@@ -863,7 +876,6 @@ public class RaftCore {
     }
 
     private void deleteDatum(String key) {
-
         Datum deleted;
         try {
             deleted = datums.remove(URLDecoder.decode(key, "UTF-8"));
@@ -881,11 +893,15 @@ public class RaftCore {
         return initialized || !globalConfig.isDataWarmup();
     }
 
+    public int getNotifyTaskCount() {
+        return notifier.getTaskSize();
+    }
+
     public class Notifier implements Runnable {
 
         private ConcurrentHashMap<String, String> services = new ConcurrentHashMap<>(10 * 1024);
 
-        private BlockingQueue<Pair> tasks = new LinkedBlockingQueue<Pair>(1024 * 1024);
+        private BlockingQueue<Pair> tasks = new LinkedBlockingQueue<>(1024 * 1024);
 
         public void addTask(String datumKey, ApplyAction action) {
 
@@ -895,6 +911,9 @@ public class RaftCore {
             if (action == ApplyAction.CHANGE) {
                 services.put(datumKey, StringUtils.EMPTY);
             }
+
+            Loggers.RAFT.info("add task {}", datumKey);
+
             tasks.add(Pair.with(datumKey, action));
         }
 
@@ -920,6 +939,8 @@ public class RaftCore {
 
                     services.remove(datumKey);
 
+                    Loggers.RAFT.info("remove task {}", datumKey);
+
                     int count = 0;
 
                     if (listeners.containsKey(KeyBuilder.SERVICE_META_KEY_PREFIX)) {
@@ -936,7 +957,7 @@ public class RaftCore {
                                         listener.onDelete(datumKey);
                                     }
                                 } catch (Throwable e) {
-                                    Loggers.RAFT.error("[NACOS-RAFT] error while notifying listener of key: {} {}", datumKey, e);
+                                    Loggers.RAFT.error("[NACOS-RAFT] error while notifying listener of key: {}", datumKey, e);
                                 }
                             }
                         }
@@ -961,7 +982,7 @@ public class RaftCore {
                                 continue;
                             }
                         } catch (Throwable e) {
-                            Loggers.RAFT.error("[NACOS-RAFT] error while notifying listener of key: {} {}", datumKey, e);
+                            Loggers.RAFT.error("[NACOS-RAFT] error while notifying listener of key: {}", datumKey, e);
                         }
                     }
 
